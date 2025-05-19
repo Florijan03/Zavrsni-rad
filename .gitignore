@@ -1,0 +1,7 @@
+# === data folders (not tracked) ===
+/common/2017/
+/common/2017/**
+
+# optional: ignore all .tif anywhere
+*.tif
+
