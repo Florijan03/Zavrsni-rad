@@ -14,7 +14,6 @@ BIN_MAP   = {0: 0, 1: 0, 2: 1, 3: 1}          # 0R/1R → class 0, 2R/3R → cla
 GRADE_RE  = re.compile(r"_(0R|1R[^_/]*|2R|3R)")
 
 def grade_from_path(path: Path) -> int:
-    """Return integer label 0-3 extracted from file path."""
     m = GRADE_RE.search(path.as_posix())
     if not m:
         raise ValueError(f"No grade token in {path}")
@@ -22,7 +21,7 @@ def grade_from_path(path: Path) -> int:
 
 
 class BiopsyDataset(Dataset):
-    """Grayscale biopsy images with on-the-fly resize + ToTensor (binary labels)."""
+    """Grayscale biopsy images taken from folder."""
     def __init__(self, root: str | Path, size: int = 256):
         self.root  = Path(root).expanduser().resolve()
         #self.files = sorted(self.root.rglob("*.tif"))
@@ -51,9 +50,7 @@ class BiopsyDataset(Dataset):
 
 class BiopsyCSVDataset(Dataset):
     """
-    CSV must contain at least columns 'image' and 'target'.
-    Each row points to an image file and its original 0-3 grade.
-    Only binary labels are returned.
+    CSV implementation
     """
     def __init__(
         self,
