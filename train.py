@@ -1,164 +1,140 @@
-#!/usr/bin/env python
-"""
-Train a simple CNN.
-
-Examples: 
-python train.py --root /Volumes/T7/zavrsni_rad --subset 1000 --epochs 1 --batch-size 4
-"""
+import argparse, time
 from pathlib import Path
-import argparse
-import torch
-import torch.nn.functional as F
+import torch, torch.nn as nn
 from torch.utils.data import DataLoader, random_split
-from torch.utils.data import Subset 
-from torchvision.transforms import Normalize
 from tqdm import tqdm
 
-from collections import defaultdict
-import random
+from common.datasets.dataset import (
+    BiopsyFolderDataset, BiopsyCSVDataset)
+from common.models.resnet_wavelet import WaveletResNet
+from common.transforms.wavelet import build_transforms_db4 as build_transforms
 
-# Local imports
-from common.datasets.dataset import BiopsyDataset, BiopsyCSVDataset
-from common.models.simple_cnn import SimpleCNN
+from torchmetrics.classification import (
+    BinaryAccuracy, BinaryPrecision, BinaryRecall, BinaryF1Score)
 
+# ────────────────────────────────────────────────────────────────────────────
+def verify_dataset(ds):
+    from collections import Counter
+    print("[VERIFY] Samples per class:", dict(Counter(ds.labels)))
 
-def get_datasets(args):
-    tf_norm = Normalize(mean=[0.5], std=[0.5])   # extra transform
+# ────────────────────────────────────────────────────────────────────────────
+def run_epoch(model, loader, crit, opt, metrics, device,
+              train: bool = True, log_int: int = 20):
 
-    if args.csv is not None:                      # CSV-based dataset
-        ds = BiopsyCSVDataset(
-            csv_file=args.csv,
-            root=args.root,
-            size=args.img_size,     
-        )
-    else:                                         # Folder-based dataset
-        ds = BiopsyDataset(
-            root=args.root,
-            size=args.img_size,                        
-        )
+    for m in metrics.values():
+        m.reset()                                 
 
-    ds.tf.transforms.append(tf_norm)
-    return ds
+    model.train() if train else model.eval()
+    tot_loss = tot_ok = 0
+    bar = tqdm(loader, desc="train" if train else "val", ncols=100)
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Binary classification training script."
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--root", type=Path, help="Root folder containing images")
-    group.add_argument("--csv",  type=Path, help="CSV file with image paths")
-
-    parser.add_argument("--img-size",   type=int,   default=256)
-    # --binary and --num-classes are not needed any more
-    # parser.add_argument("--binary", action="store_true", help="Use 2 classes")
-    # parser.add_argument("--num-classes", type=int, default=2, help="Needed only for >2 classes")
-    parser.add_argument("--batch-size", type=int,   default=8)
-    parser.add_argument("--epochs",     type=int,   default=10)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--seed",       type=int,   default=42)
-    parser.add_argument("--subset",     type=int, default=None,
-                        help="Use only the first N images (fast test)")
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed)
-
-    # Dataset and dataloaders
-    ds_full = get_datasets(args)
-    NUM_CLASSES = 2                            # Binary classification
-
-    # # Save this for later maybe
-    # # apply --subset *before* train/val split
-    # if args.subset is not None and args.subset < len(ds_full):
-    #     ds_full = Subset(ds_full, range(args.subset))
-    #     print(f"Using only the first {args.subset} images")
-
-    if args.subset is not None and args.subset < len(ds_full):
-      # ----- build index list per class -----
-      buckets = defaultdict(list)          # {label: [indices]}
-      for idx, (_, lbl) in enumerate(ds_full):
-          buckets[lbl].append(idx)
-
-      # ----- compute how many samples per class -----
-      per_class = max(1, args.subset // len(buckets))
-      chosen = []
-      random.seed(args.seed)
-      for lbl, idx_list in buckets.items():
-          random.shuffle(idx_list)
-          chosen.extend(idx_list[:per_class])
-
-      # If rounding left us short, top-up with random leftovers
-      if len(chosen) < args.subset:
-          rest = [i for i in range(len(ds_full)) if i not in chosen]
-          chosen.extend(random.sample(rest, args.subset - len(chosen)))
-
-      ds_full = Subset(ds_full, chosen)
-      print(f"Using a stratified subset of {args.subset} images "
-            f"({per_class} per class)")
-
-    n_train = int(0.8 * len(ds_full))            # 80 % training, 20 % validation
-    n_val   = len(ds_full) - n_train
-    train_ds, val_ds = random_split(
-        ds_full, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0
-    )
-    val_loader   = DataLoader(
-        val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0
-    )
-
-    # Device selection --------------------------------------------------------
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")    # Apple Silicon GPU
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")   # NVIDIA GPU (if any)
-    else:
-        device = torch.device("cpu")
-    print("Device:", device)
-
-    # Model and optimizer -----------------------------------------------------
-    model = SimpleCNN(num_classes=NUM_CLASSES).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    # Training loop -----------------------------------------------------------
-    for epoch in range(1, args.epochs + 1):
-        # ---------- train phase ----------
-        model.train()
-        train_loss, correct, total = 0.0, 0, 0
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch} [train]"):
+    with torch.set_grad_enabled(train):
+        for i, (x, y) in enumerate(bar):
             x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = F.cross_entropy(logits, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
 
-            train_loss += loss.item() * x.size(0)
-            preds = logits.argmax(dim=1)
-            correct += (preds == y).sum().item()
-            total   += y.size(0)
+            if train:
+                opt.zero_grad()
 
-        acc = correct / total * 100
-        print(f"  Train loss: {train_loss/total:.4f}  |  acc: {acc:.2f}%")
+            out = model(x)                    
+            loss = crit(out, y)
 
-        # ---------- validation phase ----------
-        model.eval()
-        val_loss, correct, total = 0.0, 0, 0
-        with torch.no_grad():
-            for x, y in tqdm(val_loader, desc=f"Epoch {epoch} [val]"):
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
-                val_loss += F.cross_entropy(logits, y, reduction="sum").item()
-                preds = logits.argmax(dim=1)
-                correct += (preds == y).sum().item()
-                total   += y.size(0)
+            if train:
+                loss.backward()
+                opt.step()
 
-        acc = correct / total * 100
-        print(f"  Val   loss: {val_loss/total:.4f}  |  acc: {acc:.2f}%")
+            tot_loss += loss.item() * x.size(0)
+            tot_ok   += (out.argmax(1) == y).sum().item()
 
+            # --- update torchmetrics --------------------------------------
+            preds = out.softmax(1)[:, 1]            # p(klasa=1)
+            for m in metrics.values():
+                m.update(preds, y)
 
+            if i % log_int == 0:
+                bar.set_postfix(loss=f"{loss.item():.3f}",
+                                acc=f"{tot_ok/((i+1)*x.size(0)):.2f}")
+
+    # --- epoch average -----------------------------------------------------
+    epoch_loss = tot_loss / len(loader.dataset)
+    epoch_acc  = tot_ok   / len(loader.dataset)
+    ep_metrics = {name: float(m.compute()) for name, m in metrics.items()}
+    return epoch_loss, epoch_acc, ep_metrics   
+
+# ────────────────────────────────────────────────────────────────────────────
+def parse():
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", required=True)
+    p.add_argument("--train-csv"); p.add_argument("--test-csv")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch",  type=int, default=8)
+    p.add_argument("--lr",     type=float, default=1e-3)
+    p.add_argument("--img-size", type=int, default=256)
+    p.add_argument("--val-split", type=float, default=0.2)
+    p.add_argument("--log-int", type=int, default=20)
+    return p.parse_args()
+
+# ────────────────────────────────────────────────────────────────────────────
+def main():
+    args   = parse()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+
+    train_t, val_t = build_transforms(args.img_size)
+
+    # ------ DATA -----------------------------------------------------------
+    if args.train_csv and args.test_csv:
+        ds_train = BiopsyCSVDataset(args.train_csv, root=args.root,
+                                    size=args.img_size, transform=train_t)
+        ds_val   = BiopsyCSVDataset(args.test_csv,  root=args.root,
+                                    size=args.img_size, transform=val_t)
+
+    dl_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True,
+                          num_workers=2, pin_memory=True)
+    dl_val   = DataLoader(ds_val,   batch_size=args.batch, shuffle=False,
+                          num_workers=2, pin_memory=True)
+
+    # ------ MODEL ----------------------------------------------------------
+    model = WaveletResNet().to(device)
+    opt   = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                              lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    crit  = nn.CrossEntropyLoss()
+
+    # torchmetrics instance for  every epoch
+    def make_metrics():                
+        return {
+            'acc' : BinaryAccuracy().to(device),
+            'rec' : BinaryRecall().to(device),
+            'prec': BinaryPrecision().to(device),
+            'f1'  : BinaryF1Score().to(device),
+        }
+
+    # ------ LOOP -----------------------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+
+        tr_loss, tr_acc, tr_m = run_epoch(
+            model, dl_train, crit, opt, make_metrics(), device,
+            train=True,  log_int=args.log_int)
+
+        vl_loss, vl_acc, vl_m = run_epoch(
+            model, dl_val, crit, opt, make_metrics(), device,
+            train=False, log_int=args.log_int)
+
+        scheduler.step()
+
+        print(f"Epoch {epoch}/{args.epochs}"
+              f" | Train {tr_loss:.4f}/{tr_acc*100:.1f}%"
+              f" (F1 {tr_m['f1']:.2f})"
+              f" | Val {vl_loss:.4f}/{vl_acc*100:.1f}%"
+              f" (F1 {vl_m['f1']:.2f}  Rec {vl_m['rec']:.2f}  Prec {vl_m['prec']:.2f})"
+              f" | {time.time()-t0:.1f}s")
+
+    # ------ SAVE -----------------------------------------------------------
+    Path("models").mkdir(exist_ok=True)
+    torch.save(model.state_dict(), "models/wavelet_resnet18.pth")
+    print("[INFO] Model saved → models/wavelet_resnet18.pth")
+
+# ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
