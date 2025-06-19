@@ -1,14 +1,20 @@
 import argparse, time
 from pathlib import Path
 import torch, torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 from tqdm import tqdm
 
-from common.datasets.dataset import (
+from common.datasets.biopsy_dataset import (
     BiopsyFolderDataset, BiopsyCSVDataset)
 from common.models.resnet_wavelet import WaveletResNet
 from common.transforms.wavelet import build_transforms_db4 as build_transforms
+# from common.transforms.wavelet import build_transforms_haar as build_transforms
 
+from torch.optim.lr_scheduler import OneCycleLR
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+# ―――  torchmetrics  ―――
 from torchmetrics.classification import (
     BinaryAccuracy, BinaryPrecision, BinaryRecall, BinaryF1Score)
 
@@ -18,6 +24,22 @@ def verify_dataset(ds):
     print("[VERIFY] Samples per class:", dict(Counter(ds.labels)))
 
 # ────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def get_preds_and_labels(model, loader, device):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    for x, y in loader:
+        x = x.to(device)
+        out = model(x)
+        preds = out.argmax(1).cpu()
+        all_preds.append(preds)
+        all_labels.append(y)
+    return torch.cat(all_preds), torch.cat(all_labels)
+
+# ──────────────────────────────────────────────────────────────────────────── 
+
 def run_epoch(model, loader, crit, opt, metrics, device,
               train: bool = True, log_int: int = 20):
 
@@ -35,13 +57,14 @@ def run_epoch(model, loader, crit, opt, metrics, device,
             if train:
                 opt.zero_grad()
 
-            out = model(x)                    
+            out = model(x)                          # [B,2]
             loss = crit(out, y)
 
             if train:
                 loss.backward()
                 opt.step()
 
+            # --- akumulirani loss & acc za brz prikaz ---------------------
             tot_loss += loss.item() * x.size(0)
             tot_ok   += (out.argmax(1) == y).sum().item()
 
@@ -58,7 +81,7 @@ def run_epoch(model, loader, crit, opt, metrics, device,
     epoch_loss = tot_loss / len(loader.dataset)
     epoch_acc  = tot_ok   / len(loader.dataset)
     ep_metrics = {name: float(m.compute()) for name, m in metrics.items()}
-    return epoch_loss, epoch_acc, ep_metrics   
+    return epoch_loss, epoch_acc, ep_metrics     # ← vraćamo sve
 
 # ────────────────────────────────────────────────────────────────────────────
 def parse():
@@ -95,12 +118,24 @@ def main():
 
     # ------ MODEL ----------------------------------------------------------
     model = WaveletResNet().to(device)
+    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     opt   = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                               lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    crit  = nn.CrossEntropyLoss()
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt,
+    #     mode='min', factor=0.5, patience=1, verbose=True)
+    scheduler = OneCycleLR(
+        optimizer=opt,
+        max_lr=args.lr,                         # ili nešto veće od args.lr
+        steps_per_epoch=len(dl_train),          # koliko batch-eva imate po epohi
+        epochs=args.epochs,
+        pct_start=0.3,                          # npr. 30% epohe raste, 70% pad
+        anneal_strategy='cos',                  # 'cos' ili 'linear'
+        div_factor=25.0,                        # početni LR = max_lr/div_factor
+        final_div_factor=1e4,                   # krajnji LR = max_lr/final_div_factor
+    )
+    # crit  = nn.CrossEntropyLoss()
 
-    # torchmetrics instance for  every epoch
     def make_metrics():                
         return {
             'acc' : BinaryAccuracy().to(device),
@@ -108,6 +143,12 @@ def main():
             'prec': BinaryPrecision().to(device),
             'f1'  : BinaryF1Score().to(device),
         }
+
+    # ――― EARLY STOPPING ―――
+    best_loss = float('inf')
+    epochs_no_improve = 0
+    patience = 8
+    Path("models").mkdir(exist_ok=True)
 
     # ------ LOOP -----------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
@@ -129,8 +170,32 @@ def main():
               f" | Val {vl_loss:.4f}/{vl_acc*100:.1f}%"
               f" (F1 {vl_m['f1']:.2f}  Rec {vl_m['rec']:.2f}  Prec {vl_m['prec']:.2f})"
               f" | {time.time()-t0:.1f}s")
+        
+        print("\n[CONFUSION MATRIX – validation set]")
+        y_pred, y_true = get_preds_and_labels(model, dl_val, device)
+        cm = confusion_matrix(y_true, y_pred)
+        print(cm) 
+
+        # ――― EARLY STOPPING CHECKPOINT ―――
+        if vl_loss < best_loss:
+            best_loss = vl_loss
+            torch.save(model.state_dict(), "models/wavelet_resnet18_best.pth")
+            print(f"[INFO] Best model saved at epoch {epoch} (val_loss={vl_loss:.4f})")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve > patience:
+                print(f"[INFO] Early stopping triggered after epoch {epoch}.")
+                break
+        
 
     # ------ SAVE -----------------------------------------------------------
+
+    # print("\n[CONFUSION MATRIX – validation set]")
+    # y_pred, y_true = get_preds_and_labels(model, dl_val, device)
+    # cm = confusion_matrix(y_true, y_pred)
+    # print(cm) 
+
     Path("models").mkdir(exist_ok=True)
     torch.save(model.state_dict(), "models/wavelet_resnet18.pth")
     print("[INFO] Model saved → models/wavelet_resnet18.pth")
