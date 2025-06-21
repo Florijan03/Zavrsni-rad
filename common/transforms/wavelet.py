@@ -10,7 +10,7 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 # ------------------------------------------------------------------ #
 class _WaveletBase:
-    """**3** channels (cA, cH, cV)."""
+    """3 channels (cA, cH, cV)."""
     def __init__(self, wavelet="haar", img_size=256):
         self.wavelet  = wavelet
         self.img_size = img_size
@@ -24,11 +24,11 @@ class _WaveletBase:
         # 2) u [-1,1]  numpy
         arr = np.array(img, np.float32) / 255.0 * 2.0 - 1.0
 
-        # 3) SWT → uzimamo samo cA,cH,cV
+        # 3) SWT → cA,cH,cV
         cA,(cH,cV,_) = pywt.swt2(arr, wavelet=self.wavelet, level=1)[0]
         coeffs = np.stack([cA, cH, cV], axis=0)          # [3,H,W]
 
-        # 4) standardizacija po kanalu
+        # 4) standradization
         coeffs = (coeffs - coeffs.mean((1,2), keepdims=True)) / (
                  coeffs.std((1,2), keepdims=True) + 1e-6)
 
